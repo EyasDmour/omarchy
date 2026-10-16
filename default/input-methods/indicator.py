@@ -116,7 +116,6 @@ class InputFeedback:
 
   def __init__(self, indicator):
     self.indicator = indicator
-    self.identity = None
     self.message = {"session": f"{os.getpid()}:{GLib.get_monotonic_time()}", "serial": 0}
 
   def observe(self, state):
@@ -135,10 +134,8 @@ class InputFeedback:
         selection = {"key": current, "language": state.get("language", ""), "name": state.get("name", "")}
       else:
         return self.message
-      identity = selection["key"]
-      if identity != self.identity:
-        serial = self.message["serial"] + (self.identity is not None)
-        self.identity = identity
+      if selection["key"] != self.message.get("key"):
+        serial = self.message["serial"] + ("key" in self.message)
         self.message = {"session": self.message["session"], "serial": serial, **selection}
     except Exception as error:
       # Cosmetic metadata is deliberately outside the input error handler.
