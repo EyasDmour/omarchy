@@ -185,7 +185,8 @@ class Indicator:
     self.pending = following
     for command in layout_switches(keyboards, index) if index is not None else []:
       subprocess.run(command, check=True, capture_output=True)
-    self.remember_layout(index if index is not None else 0)
+    if index is not None:
+      self.remember_layout(index)
     self.refresh()
 
   def refresh(self):
