@@ -118,6 +118,66 @@ assert call.call_args_list[0].args[2].unpack() == ("keyboard-us",)
 assert all(command[-1] == "0" for command in commands)
 print("ok - layouts and composition engines share one cycle and returning to direct input resets the layout")
 
+# Fcitx translates an engine's layout relative to the group's leading layout.
+# Entering an engine from a secondary compositor layout must restore that base
+# before SetCurrentIM, for every matching keyboard and in either direction.
+for layouts, variants, primary in [
+  ("us,ara", ",", "keyboard-us"),
+  ("us,ru", ",", "keyboard-us"),
+  ("us,gr", ",", "keyboard-us"),
+  ("us,fr", ",", "keyboard-us"),
+  ("fr,ara", "oss,", "keyboard-fr-oss"),
+  ("jp,ru", ",", "keyboard-jp"),
+]:
+  for engine in ("mozc", "pinyin", "hangul", "chewing", "cangjie5"):
+    for step in (1, -1):
+      seat = [
+        {"name": "physical", "layout": layouts, "variant": variants, "active_layout_index": 1 if step == 1 else 0},
+        {"name": "second keyboard", "layout": layouts, "variant": variants, "active_layout_index": 1 if step == 1 else 0},
+        {"name": "custom", "layout": "de", "active_layout_index": 0},
+      ]
+      state = {"methods": [primary, engine], "current": primary}
+      switches = []
+      def switch_layout(command, **kwargs):
+        if command[:3] == ["hyprctl", "-j", "devices"]:
+          return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"keyboards": seat}))
+        switches.append(command)
+        keyboard = next(item for item in seat if item["name"] == command[2])
+        keyboard["active_layout_index"] = int(command[3])
+        return subprocess.CompletedProcess(command, 0)
+      def activate_engine(bus, method, args=None):
+        assert method == "SetCurrentIM" and args.unpack() == (engine,)
+        assert all(item["active_layout_index"] == 0 for item in seat[:2]), (layouts, engine, step, seat)
+        state["current"] = engine
+        return ()
+      with patch.object(indicator, "snapshot", side_effect=lambda bus: dict(state)), patch.object(indicator, "call", side_effect=activate_engine), patch.object(indicator.subprocess, "run", side_effect=switch_layout):
+        reader = indicator.Indicator(None)
+        reader.select_next(step)
+      assert switches == [["hyprctl", "switchxkblayout", item["name"], "0"] for item in seat[:2]]
+      assert state["current"] == engine and reader.pending == ""
+      assert all(item["variant"] == variants and item["layout"] == layouts for item in seat[:2])
+      assert seat[2]["active_layout_index"] == 0
+print("ok - entering every composition engine restores the leading layout before activation, including variants and reverse cycles")
+
+for current, step, target in [("mozc", 1, "hangul"), ("hangul", -1, "mozc")]:
+  seat = [{"name": "physical", "layout": "us,ara", "active_layout_index": 1}]
+  with patch.object(indicator, "snapshot", return_value={"methods": ["keyboard-us", "mozc", "hangul"], "current": current}), patch.object(indicator, "call") as call, patch.object(indicator.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps({"keyboards": seat}))) as process:
+    indicator.Indicator(None).select_next(step)
+  commands = [command.args[0] for command in process.call_args_list[1:]]
+  assert commands == [["hyprctl", "switchxkblayout", "physical", "0"]]
+  assert call.call_args_list[0].args[2].unpack() == (target,)
+print("ok - cycling between engines also restores a secondary layout left by another input path")
+
+with patch.object(indicator, "snapshot", return_value={"methods": ["keyboard-us", "mozc"], "current": "keyboard-us"}), patch.object(indicator, "call") as call, patch.object(indicator.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, stdout=json.dumps({"keyboards": [{"name": "physical", "layout": "us,ara", "active_layout_index": 1}]})), subprocess.CalledProcessError(1, "hyprctl")]):
+  try:
+    indicator.Indicator(None).select_next()
+  except subprocess.CalledProcessError:
+    pass
+  else:
+    raise AssertionError("a failed layout reset must not activate the engine")
+  call.assert_not_called()
+print("ok - a failed layout reset does not activate an engine against the wrong keyboard")
+
 keyboards = [{"name": "physical", "layout": "us,dk", "active_layout_index": 0}]
 live = {"methods": ["keyboard-us", "pinyin"], "current": "", "name": "", "label": "", "language": ""}
 selected.clear()
@@ -132,6 +192,7 @@ with patch.object(indicator, "snapshot", side_effect=lambda bus: dict(live)), pa
   reader.select_next()
   assert keyboards[0]["active_layout_index"] == 1
   reader.select_next()
+  assert keyboards[0]["active_layout_index"] == 0
   assert reader.pending == "pinyin" and selected == []
   assert reader.refresh()["current"] == "pinyin"
   live["current"] = "keyboard-us"
