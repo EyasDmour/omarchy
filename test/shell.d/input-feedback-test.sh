@@ -8,9 +8,8 @@ import copy
 import importlib.util
 import json
 import os
-import socket
 import subprocess
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("indicator", os.environ["OMARCHY_PATH"] + "/default/input-methods/indicator.py")
 indicator = importlib.util.module_from_spec(spec)
@@ -61,10 +60,9 @@ single.keyboards = [{"name": "physical", "layout": "us", "main": True, "active_l
 single_feedback = indicator.InputFeedback(single)
 single_feedback.observe(japanese)
 assert single_feedback.observe({"methods": [], "current": ""})["language"] == "eng"
-with patch.object(indicator.socket, "socket", side_effect=OSError("no socket")), \
-     patch.object(indicator.subprocess, "run", side_effect=OSError("no compositor")), patch("builtins.print"):
-  assert indicator.follow_layouts(single, Mock()) is None
-print("ok - a single layout also recovers from Fcitx loss, and an unavailable event socket is harmless")
+with patch.object(indicator.subprocess, "run", side_effect=OSError("no compositor")), patch("builtins.print"):
+  assert not single.refresh_layouts()
+print("ok - a single layout also recovers from Fcitx loss, and an unavailable compositor is harmless")
 
 live = dict(english)
 refuse = [True]
@@ -97,41 +95,23 @@ with patch.object(indicator, "snapshot", side_effect=lambda bus: dict(live)), \
   assert sum(call.args[0] == ["hyprctl", "-j", "devices"] for call in run.call_args_list) == 1
 print("ok - a refused engine is not announced; acknowledgement needs no extra compositor query")
 
-# Drive real socket reads through the GLib callback without a compositor.
+# Events arrive through the reader's existing command pipe.
 keyboards[0]["active_layout_index"] = 0
 reader = indicator.Indicator(None)
-listener, sender = socket.socketpair()
-transport = Mock()
-transport.fileno.return_value = listener.fileno()
-transport.recv.side_effect = listener.recv
-transport.close.side_effect = listener.close
-callback = []
-changed = Mock()
-with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/unused", "HYPRLAND_INSTANCE_SIGNATURE": "test"}), \
-     patch.object(indicator.socket, "socket", return_value=transport), \
-     patch.object(indicator.GLib, "io_add_watch", side_effect=lambda fd, flags, fn: callback.append(fn) or 1), \
-     patch.object(indicator.subprocess, "run", side_effect=process) as run:
-  watcher = indicator.follow_layouts(reader, changed)
-  assert run.call_count == 1 and changed.call_count == 0
-  sender.sendall(b"activelayout>>physical,English (US)\n")
-  callback[0](None, None)
+with patch.object(indicator.subprocess, "run", side_effect=process) as run:
+  assert reader.refresh_layouts()
   assert run.call_count == 1
-  sender.sendall(b"activelayout>>physical,Ara")
-  callback[0](None, None)
+  assert not reader.refresh_layouts("physical,English (US)")
   assert run.call_count == 1
   keyboards[0]["active_layout_index"] = 1
-  sender.sendall(b"bic\n")
-  callback[0](None, None)
-  assert run.call_count == 2 and changed.call_count == 1
+  assert reader.refresh_layouts("physical,Arabic")
+  assert run.call_count == 2
   assert reader.keyboards[0]["active_layout_index"] == 1
   reader.pending = "mozc"
   run.side_effect = subprocess.TimeoutExpired("hyprctl", 1)
   with patch("builtins.print"):
-    sender.sendall(b"configreloaded>>\n")
-    callback[0](None, None)
+    assert not reader.refresh_layouts()
   assert reader.pending == "mozc"
   assert reader.keyboards[0]["active_layout_index"] == 1
-  sender.close()
-  assert callback[0](None, None) == indicator.GLib.SOURCE_REMOVE
-print("ok - compositor events handle split frames, skip known changes, and isolate query failures")
+print("ok - compositor metadata skips known events and isolates query failures from pending input")
 PY

@@ -10,10 +10,8 @@ function inputLanguage(selection, localeFor) {
   if (!selection) return ""
   var code = String(selection.language || "")
   if (code && /^[a-z]{2,3}(?:[_-][A-Za-z0-9]+)*$/.test(code)) {
-    var locale = localeFor(code)
     // A language-only English code should use the generic CLDR name.
-    if ((code === "en" || code === "eng") && locale.name.indexOf("en_") === 0)
-      locale = localeFor("en_001")
+    var locale = localeFor(code === "en" || code === "eng" ? "en_001" : code)
     if (locale.name !== "C" && locale.nativeLanguageName) return locale.nativeLanguageName
   }
   return String(selection.name || "")

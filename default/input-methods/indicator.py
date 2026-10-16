@@ -5,7 +5,6 @@ from functools import lru_cache
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 from xml.etree import ElementTree
@@ -162,6 +161,22 @@ class Indicator:
         if item.get("layout") == keyboard["layout"]:
           item["active_layout_index"] = index
 
+  def refresh_layouts(self, event=None):
+    try:
+      if event is not None:
+        name, _, description = event.partition(",")
+        device = next((item for item in self.keyboards if item.get("name") == name), None)
+        # Native cycling already knows the layout it just applied.
+        if device and description == keyboard_language(device)["name"]:
+          return False
+      devices = subprocess.run(["hyprctl", "-j", "devices"], check=True, text=True, capture_output=True, timeout=1)
+      self.keyboards = json.loads(devices.stdout).get("keyboards", [])
+      return True
+    except Exception as error:
+      # Layout metadata is cosmetic; never clear a queued selection here.
+      print(f"Input feedback: {error}", file=sys.stderr)
+      return False
+
   def select_next(self, step=1):
     devices = subprocess.run(["hyprctl", "-j", "devices"], check=True, text=True, capture_output=True)
     keyboards = json.loads(devices.stdout).get("keyboards", [])
@@ -297,64 +312,6 @@ def follow(bus, changed, presence):
   return [name, profile]
 
 
-def follow_layouts(indicator, changed):
-  """Refresh layout metadata on compositor events, without an idle poll."""
-  def read():
-    try:
-      result = subprocess.run(["hyprctl", "-j", "devices"], check=True, text=True, capture_output=True, timeout=1)
-      indicator.keyboards = json.loads(result.stdout).get("keyboards", [])
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-      print(f"Input feedback: {error}", file=sys.stderr)
-
-  read()
-  connection = None
-  try:
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(1)
-    path = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr", os.environ["HYPRLAND_INSTANCE_SIGNATURE"], ".socket2.sock")
-    connection.connect(path)
-    connection.setblocking(False)
-  except (OSError, KeyError):
-    if connection is not None:
-      connection.close()
-    return None
-  buffer = ""
-
-  def event(source, condition):
-    nonlocal buffer
-    try:
-      data = connection.recv(65536)
-    except BlockingIOError:
-      return GLib.SOURCE_CONTINUE
-    except OSError:
-      data = b""
-    if not data:
-      connection.close()
-      return GLib.SOURCE_REMOVE
-    buffer += data.decode(errors="replace")
-    refresh = False
-    while "\n" in buffer:
-      line, buffer = buffer.split("\n", 1)
-      if line.startswith("activelayout>>"):
-        name, _, description = line[len("activelayout>>"):].partition(",")
-        keyboard = layout_keyboard(indicator.keyboards)
-        device = next((item for item in indicator.keyboards if item.get("name") == name), None)
-        try:
-          # Native cycling already knows the layout it just applied.
-          refresh |= not device or not keyboard or (
-            device.get("layout") == keyboard["layout"] and description != keyboard_language(device)["name"])
-        except Exception:
-          refresh = True
-      elif line == "configreloaded>>":
-        refresh = True
-    if refresh:
-      read()
-      changed()
-    return GLib.SOURCE_CONTINUE
-
-  return connection, GLib.io_add_watch(connection.fileno(), GLib.IO_IN | GLib.IO_HUP, event)
-
-
 def watch(bus):
   previous = None
   indicator = Indicator(bus)
@@ -437,7 +394,7 @@ def watch(bus):
     if not data:
       loop.quit()
       return GLib.SOURCE_REMOVE
-    buffer += data.decode()
+    buffer += data.decode(errors="replace")
     while "\n" in buffer:
       line, buffer = buffer.split("\n", 1)
       if line in ("cycle", "cycle back"):
@@ -446,6 +403,12 @@ def watch(bus):
         except (GLib.Error, OSError, ValueError, subprocess.CalledProcessError):
           indicator.pending = ""
         refresh()
+      elif line == "layouts" or line.startswith("layout "):
+        try:
+          if indicator.refresh_layouts(json.loads(line[7:]) if line.startswith("layout ") else None):
+            changed()
+        except ValueError:
+          pass
     schedule()
     return GLib.SOURCE_CONTINUE
 
@@ -456,7 +419,7 @@ def watch(bus):
   GLib.io_add_watch(sys.stdin, GLib.IO_IN | GLib.IO_HUP, command)
   # Held for as long as the loop runs.
   watchers = follow(bus, changed, presence)  # noqa: F841
-  layout_watcher = follow_layouts(indicator, changed)  # noqa: F841
+  indicator.refresh_layouts()
   poll()
   loop.run()
 
