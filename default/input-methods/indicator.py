@@ -182,11 +182,13 @@ class Indicator:
     following, index = cycle_choice(state, keyboards, step)
     if following is None:
       return
+    applied = None
     self.pending = following
     for command in layout_switches(keyboards, index) if index is not None else []:
       subprocess.run(command, check=True, capture_output=True)
-    if index is not None:
-      self.remember_layout(index)
+      applied = index if index is not None else 0
+    if applied is not None:
+      self.remember_layout(applied)
     self.refresh()
 
   def refresh(self):
