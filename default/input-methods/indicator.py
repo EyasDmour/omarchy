@@ -1,11 +1,14 @@
-"""Live Fcitx state for the existing keyboard layout widget."""
+"""Shared input selection and feedback for the shell."""
 
 from collections import Counter
+from functools import lru_cache
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+from xml.etree import ElementTree
 
 from gi.repository import Gio, GLib
 
@@ -77,22 +80,101 @@ def cycle_choice(state, keyboards, step=1):
   return choices[(choices.index(position) + step) % len(choices)]
 
 
+@lru_cache(maxsize=1)
+def layout_languages():
+  result = {}
+  for name in ("evdev.xml", "evdev.extras.xml"):
+    path = "/usr/share/X11/xkb/rules/" + name
+    try:
+      layouts = ElementTree.parse(path).findall("./layoutList/layout")
+    except FileNotFoundError:
+      continue
+    except (OSError, ElementTree.ParseError) as error:
+      print(f"Input feedback: {error}", file=sys.stderr)
+      continue
+    for layout in layouts:
+      item = layout.find("configItem")
+      language = item.findtext("languageList/iso639Id", "")
+      result[(item.findtext("name"), "")] = (language, item.findtext("description", ""))
+      for variant in layout.findall("./variantList/variant/configItem"):
+        result[(item.findtext("name"), variant.findtext("name"))] = (
+          variant.findtext("languageList/iso639Id", language), variant.findtext("description", ""))
+  return result
+
+
+def keyboard_language(keyboard):
+  index = keyboard.get("active_layout_index", 0)
+  layouts = keyboard.get("layout", "").split(",")
+  variants = keyboard.get("variant", "").split(",")
+  layout = layouts[index]
+  variant = variants[index] if index < len(variants) else ""
+  language, name = layout_languages().get((layout, variant), ("", layout))
+  return {"key": layout + ":" + variant, "language": language, "name": name}
+
+
+class InputFeedback:
+  """Presentation metadata only; failures here must never alter input selection."""
+
+  def __init__(self, indicator):
+    self.indicator = indicator
+    self.identity = None
+    self.message = {"session": f"{os.getpid()}:{GLib.get_monotonic_time()}", "serial": 0}
+
+  def observe(self, state):
+    try:
+      # A queued or refused selection is not an activation acknowledgement.
+      if self.indicator.pending:
+        return self.message
+      current = state.get("current", "")
+      primary = next((method for method in state.get("methods", []) if method.startswith("keyboard-")), "")
+      keyboard = layout_keyboard(self.indicator.keyboards)
+      if keyboard is None:
+        keyboard = next((item for item in self.indicator.keyboards if item.get("main")), None)
+      if keyboard and (not current or current == primary):
+        selection = keyboard_language(keyboard)
+      elif current:
+        selection = {"key": current, "language": state.get("language", ""), "name": state.get("name", "")}
+      else:
+        return self.message
+      identity = selection["key"]
+      if identity != self.identity:
+        serial = self.message["serial"] + (self.identity is not None)
+        self.identity = identity
+        self.message = {"session": self.message["session"], "serial": serial, **selection}
+    except Exception as error:
+      # Cosmetic metadata is deliberately outside the input error handler.
+      print(f"Input feedback: {error}", file=sys.stderr)
+    return self.message
+
+
 class Indicator:
   def __init__(self, bus):
     self.bus = bus
     self.pending = ""
     self.last = ""
     self.entries = {}
+    self.keyboards = []
+
+  def remember_layout(self, index):
+    keyboard = layout_keyboard(self.keyboards)
+    if keyboard:
+      for item in self.keyboards:
+        if item.get("layout") == keyboard["layout"]:
+          item["active_layout_index"] = index
 
   def select_next(self, step=1):
     devices = subprocess.run(["hyprctl", "-j", "devices"], check=True, text=True, capture_output=True)
     keyboards = json.loads(devices.stdout).get("keyboards", [])
+    self.keyboards = keyboards
     try:
       state = snapshot(self.bus)
     except GLib.Error:
       # Without Fcitx, Super+I still cycles the compositor layouts.
       for command in layout_switches(keyboards, step=step):
         subprocess.run(command, check=True, capture_output=True)
+      keyboard = layout_keyboard(keyboards)
+      if keyboard:
+        self.remember_layout((keyboard.get("active_layout_index", 0) + step) % len(keyboard["layout"].split(",")))
       return
     methods = state["methods"]
     current = self.pending or state["current"] or self.last
@@ -103,6 +185,7 @@ class Indicator:
     self.pending = following
     for command in layout_switches(keyboards, index) if index is not None else []:
       subprocess.run(command, check=True, capture_output=True)
+    self.remember_layout(index if index is not None else 0)
     self.refresh()
 
   def refresh(self):
@@ -211,9 +294,68 @@ def follow(bus, changed, presence):
   return [name, profile]
 
 
+def follow_layouts(indicator, changed):
+  """Refresh layout metadata on compositor events, without an idle poll."""
+  def read():
+    try:
+      result = subprocess.run(["hyprctl", "-j", "devices"], check=True, text=True, capture_output=True, timeout=1)
+      indicator.keyboards = json.loads(result.stdout).get("keyboards", [])
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+      print(f"Input feedback: {error}", file=sys.stderr)
+
+  read()
+  connection = None
+  try:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(1)
+    path = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr", os.environ["HYPRLAND_INSTANCE_SIGNATURE"], ".socket2.sock")
+    connection.connect(path)
+    connection.setblocking(False)
+  except (OSError, KeyError):
+    if connection is not None:
+      connection.close()
+    return None
+  buffer = ""
+
+  def event(source, condition):
+    nonlocal buffer
+    try:
+      data = connection.recv(65536)
+    except BlockingIOError:
+      return GLib.SOURCE_CONTINUE
+    except OSError:
+      data = b""
+    if not data:
+      connection.close()
+      return GLib.SOURCE_REMOVE
+    buffer += data.decode(errors="replace")
+    refresh = False
+    while "\n" in buffer:
+      line, buffer = buffer.split("\n", 1)
+      if line.startswith("activelayout>>"):
+        name, _, description = line[len("activelayout>>"):].partition(",")
+        keyboard = layout_keyboard(indicator.keyboards)
+        device = next((item for item in indicator.keyboards if item.get("name") == name), None)
+        try:
+          # Native cycling already knows the layout it just applied.
+          refresh |= not device or not keyboard or (
+            device.get("layout") == keyboard["layout"] and description != keyboard_language(device)["name"])
+        except Exception:
+          refresh = True
+      elif line == "configreloaded>>":
+        refresh = True
+    if refresh:
+      read()
+      changed()
+    return GLib.SOURCE_CONTINUE
+
+  return connection, GLib.io_add_watch(connection.fileno(), GLib.IO_IN | GLib.IO_HUP, event)
+
+
 def watch(bus):
   previous = None
   indicator = Indicator(bus)
+  feedback = InputFeedback(indicator)
   loop = GLib.MainLoop()
   buffer = ""
   timer = 0
@@ -240,7 +382,7 @@ def watch(bus):
         failed = False
       except GLib.Error:
         failed = True
-    line = json.dumps(state, ensure_ascii=False)
+    line = json.dumps({**state, "switch": feedback.observe(state)}, ensure_ascii=False)
     if line != previous:
       print(line, flush=True)
       previous = line
@@ -311,6 +453,7 @@ def watch(bus):
   GLib.io_add_watch(sys.stdin, GLib.IO_IN | GLib.IO_HUP, command)
   # Held for as long as the loop runs.
   watchers = follow(bus, changed, presence)  # noqa: F841
+  layout_watcher = follow_layouts(indicator, changed)  # noqa: F841
   poll()
   loop.run()
 
