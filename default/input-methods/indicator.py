@@ -30,10 +30,13 @@ def snapshot(bus):
   return {"methods": methods, "current": info[0], "name": info[1], "label": info[4], "language": info[5]}
 
 
-def layout_keyboard(keyboards):
-  typed = [keyboard for keyboard in keyboards if not re.match(
+def typed_keyboards(keyboards):
+  return [keyboard for keyboard in keyboards if not re.match(
     r"^(hl-virtual-keyboard|power-button|sleep-button|lid-switch|video-bus)", keyboard.get("name", ""))]
-  typed = [item for item in typed if len(item.get("layout", "").split(",")) > 1]
+
+
+def layout_keyboard(keyboards):
+  typed = [item for item in typed_keyboards(keyboards) if len(item.get("layout", "").split(",")) > 1]
   if not typed:
     return None
   # Consumer controls also carry the seat layout. Its frequency keeps an
@@ -125,9 +128,7 @@ class InputFeedback:
         return self.message
       current = state.get("current", "")
       primary = next((method for method in state.get("methods", []) if method.startswith("keyboard-")), "")
-      keyboard = layout_keyboard(self.indicator.keyboards)
-      if keyboard is None:
-        keyboard = next((item for item in self.indicator.keyboards if item.get("main")), None)
+      keyboard = self.indicator.feedback_keyboard()
       if keyboard and (not current or current == primary):
         selection = keyboard_language(keyboard)
         selection["layout"] = selection["name"]
@@ -151,6 +152,14 @@ class Indicator:
     self.last = ""
     self.entries = {}
     self.keyboards = []
+    self.typed_keyboard_name = ""
+
+  def feedback_keyboard(self):
+    # Match the bar's selectKeyboard: follow the event keyboard even after it
+    # wraps to the first layout, falling back to layout progress if it vanishes.
+    typed = typed_keyboards(self.keyboards)
+    return next((item for item in typed if item.get("name") == self.typed_keyboard_name), None) or max(
+      typed, key=lambda item: item.get("active_layout_index", 0), default=None)
 
   def remember_layout(self, index):
     keyboard = layout_keyboard(self.keyboards)
@@ -163,10 +172,14 @@ class Indicator:
     try:
       if event is not None:
         name, _, description = event.partition(",")
+        if name.startswith("hl-virtual-keyboard"):
+          return False
+        previous_name = self.typed_keyboard_name
+        self.typed_keyboard_name = name
         device = next((item for item in self.keyboards if item.get("name") == name), None)
         # Native cycling already knows the layout it just applied.
         if device and description == keyboard_language(device)["name"]:
-          return False
+          return previous_name != name
       devices = subprocess.run(["hyprctl", "-j", "devices"], check=True, text=True, capture_output=True, timeout=1)
       self.keyboards = json.loads(devices.stdout).get("keyboards", [])
       return True

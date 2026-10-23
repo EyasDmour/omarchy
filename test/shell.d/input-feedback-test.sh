@@ -108,6 +108,7 @@ reader = indicator.Indicator(None)
 with patch.object(indicator.subprocess, "run", side_effect=process) as run:
   assert reader.refresh_layouts()
   assert run.call_count == 1
+  assert reader.refresh_layouts("physical,English (US)")
   assert not reader.refresh_layouts("physical,English (US)")
   assert run.call_count == 1
   keyboards[0]["active_layout_index"] = 1
@@ -121,4 +122,27 @@ with patch.object(indicator.subprocess, "run", side_effect=process) as run:
   assert reader.pending == "mozc"
   assert reader.keyboards[0]["active_layout_index"] == 1
 print("ok - compositor metadata skips known events and isolates query failures from pending input")
+
+# A keyboard can wrap to US while another remains on the second layout.
+reader = indicator.Indicator(None)
+reader.keyboards = [
+  {"name": "built-in", "layout": "us,de", "active_layout_index": 0},
+  {"name": "usb", "layout": "us,de", "active_layout_index": 1},
+  {"name": "power-button", "layout": "us,de", "active_layout_index": 1},
+]
+feedback = indicator.InputFeedback(reader)
+assert feedback.observe(english)["layout"] == "German"
+with patch.object(indicator.subprocess, "run") as run:
+  reader.refresh_layouts("built-in,English (US)")
+  assert feedback.observe(english)["layout"] == "English (US)"
+  assert not reader.refresh_layouts("built-in,English (US)")
+  reader.refresh_layouts("hl-virtual-keyboard,English (US)")
+  assert feedback.observe(english)["layout"] == "English (US)"
+  assert run.call_count == 0
+reader.keyboards = [item for item in reader.keyboards if item["name"] != "built-in"]
+assert feedback.observe(english)["layout"] == "German"
+reader.keyboards[0] = {"name": "usb", "layout": "fr", "active_layout_index": 0}
+reader.refresh_layouts("usb,French")
+assert feedback.observe(english)["layout"] == "French"
+print("ok - confirmed feedback follows the event keyboard, including wraparound, removal and a single-layout override")
 PY
