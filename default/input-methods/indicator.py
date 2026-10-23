@@ -130,13 +130,14 @@ class InputFeedback:
         keyboard = next((item for item in self.indicator.keyboards if item.get("main")), None)
       if keyboard and (not current or current == primary):
         selection = keyboard_language(keyboard)
+        selection["layout"] = selection["name"]
       elif current:
         selection = {"key": current, "language": state.get("language", ""), "name": state.get("name", "")}
       else:
         return self.message
-      if selection["key"] != self.message.get("key"):
-        serial = self.message["serial"] + ("key" in self.message)
-        self.message = {"session": self.message["session"], "serial": serial, **selection}
+      selection.update(current=current, label=state.get("label", ""))
+      serial = self.message["serial"] + ("key" in self.message and selection["key"] != self.message["key"])
+      self.message = {"session": self.message["session"], "serial": serial, **selection}
     except Exception as error:
       # Cosmetic metadata is deliberately outside the input error handler.
       print(f"Input feedback: {error}", file=sys.stderr)

@@ -20,7 +20,7 @@ reader = indicator.Indicator(None)
 reader.keyboards = copy.deepcopy(keyboards)
 feedback = indicator.InputFeedback(reader)
 english = {"methods": ["keyboard-us", "mozc"], "current": "keyboard-us", "language": "en", "name": "English"}
-japanese = {**english, "current": "mozc", "language": "ja", "name": "Mozc"}
+japanese = {**english, "current": "mozc", "language": "ja", "name": "Mozc", "label": "あ"}
 initial = dict(feedback.observe(english))
 assert initial["serial"] == 0 and initial["language"] == "eng"
 assert feedback.observe(english) == initial
@@ -28,12 +28,17 @@ reader.remember_layout(1)
 arabic = dict(feedback.observe(english))
 assert arabic["serial"] == 1 and arabic["language"] == "ara"
 reader.pending = "mozc"
+reader.remember_layout(0)
+assert feedback.observe(english) == arabic
 assert feedback.observe(japanese) == arabic
 reader.pending = ""
 reader.remember_layout(0)
 activated = dict(feedback.observe(japanese))
 assert activated["serial"] == 2 and activated["language"] == "ja"
+assert activated["current"] == "mozc" and activated["label"] == "あ"
 assert feedback.observe(japanese) == activated
+katakana = feedback.observe({**japanese, "label": "ア"})
+assert katakana["label"] == "ア" and katakana["serial"] == activated["serial"]
 assert feedback.observe(english)["serial"] == 3
 assert indicator.InputFeedback(reader).observe(english)["serial"] == 0
 print("ok - feedback follows confirmed changes once, including external switches, and starts silently")
@@ -41,7 +46,9 @@ print("ok - feedback follows confirmed changes once, including external switches
 reader.remember_layout(1)
 fallback = dict(feedback.observe({"methods": [], "current": ""}))
 assert fallback["language"] == "ara" and fallback["serial"] == 4
-assert feedback.observe(english) == fallback
+assert fallback["layout"] == "Arabic" and fallback["current"] == ""
+assert feedback.observe(english)["serial"] == fallback["serial"]
+fallback = dict(feedback.observe(english))
 reader.pending = "mozc"
 with patch.object(indicator, "keyboard_language", side_effect=ValueError("bad metadata")), patch("builtins.print"):
   reader.pending = ""
